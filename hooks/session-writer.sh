@@ -58,11 +58,14 @@ if [ -d "$project_dir" ]; then
     fi
 fi
 
-# ── Session title ─────────────────────────────────────────────────────────────
+# ── Session title + slug ───────────────────────────────────────────────────────
 _session_title=""
+_slug=""
 if [ -f "$transcript_path" ]; then
     _session_title=$(grep '"customTitle"' "$transcript_path" 2>/dev/null | tail -1 | \
         jq -r '.customTitle // ""' 2>/dev/null) || _session_title=""
+    _slug=$(grep '"slug"' "$transcript_path" 2>/dev/null | tail -1 | \
+        jq -r '.slug // ""' 2>/dev/null) || _slug=""
 fi
 
 # ── Incremental JSONL parsing for model + tokens ──────────────────────────────
@@ -158,10 +161,11 @@ jq -n \
     --arg tout   "${total_output:-0}" \
     --arg mem    "${_mem:-0}" \
     --arg stitle "${_session_title:-}" \
+    --arg slug   "${_slug:-}" \
     '{pid:($pid|tonumber),epoch:($epoch|tonumber),model:$model,
       project_dir:$pdir,project_name:$pname,git_branch:$branch,
       status:$status,last_activity:"",
       used_pct:($pct|tonumber),tokens_in:($tin|tonumber),
       tokens_out:($tout|tonumber),mem_kb:($mem|tonumber),
-      cost_usd:0,session_title:$stitle}' \
+      cost_usd:0,session_title:$stitle,slug:$slug}' \
     > "$_tmp" 2>/dev/null && mv "$_tmp" "$_sf" 2>/dev/null || rm -f "$_tmp"

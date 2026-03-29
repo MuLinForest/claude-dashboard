@@ -155,6 +155,7 @@ def sessions_json() -> list[dict]:
         {
             "pid": s.pid,
             "name": s.display_name,
+            "name_source": "session" if s.session_title else ("slug" if s.slug else "project"),
             "project": s.project_name,
             "model": s.short_model,
             "status": s.status,
@@ -464,6 +465,8 @@ const I18N = {
     hdrSession: 'Session', hdrProject: 'Project', hdrDate: 'Date',
     avgPerReq: 'Avg / request', tokenBreakdown: 'Token Breakdown', perReq: '/ req',
     tipModel: 'AI model used', tipBranch: 'Git branch', tipPid: 'Process ID', tipMem: 'Memory usage (RAM)', tipOutputTokens: 'Output tokens — response from Claude', tipCtx: 'Context window usage',
+    nameSession: 'Session Name', nameSlug: 'Slug', nameProject: 'Project Name',
+    dataSource: 'Data from local JSONL transcripts (~/.claude/projects/)',
   },
   'zh-TW': {
     sessions: '工作階段', usage: '用量', models: '模型',
@@ -482,6 +485,8 @@ const I18N = {
     hdrSession: '工作階段', hdrProject: '專案', hdrDate: '日期',
     avgPerReq: '平均每次請求', tokenBreakdown: 'Token 組成', perReq: '/ 次',
     tipModel: '使用的 AI 模型', tipBranch: 'Git 分支', tipPid: '程序 ID', tipMem: '記憶體用量 (RAM)', tipOutputTokens: 'Output tokens — Claude 的回應量', tipCtx: 'Context window 使用率',
+    nameSession: '工作階段名稱', nameSlug: '自動名稱 (Slug)', nameProject: '專案名稱',
+    dataSource: '資料來自本機 JSONL 對話紀錄 (~/.claude/projects/)',
   }
 };
 let lang = localStorage.getItem('lang') || 'en';
@@ -580,7 +585,7 @@ function sessionCardHtml(s) {
   return `<div class="session" id="session-${s.pid}" onclick="toggleSession(${s.pid})">
     <div class="row1">
       <span class="expand-icon">\u25B8</span>
-      <span class="name" data-f="name">${esc(s.name)}</span>
+      <span class="name" data-f="name" title="${{session:t('nameSession'),slug:t('nameSlug'),project:t('nameProject')}[s.name_source]}" style="cursor:help">${esc(s.name)}</span>
       ${s.name !== s.project ? `<span class="meta">${esc(s.project)}</span>` : ''}
       <span class="status ${statusClass(s.status)}" data-f="status">${s.status.toUpperCase()}</span>
     </div>
@@ -657,6 +662,7 @@ function renderUsage() {
   const h = historyData, s = cs();
   let html = '';
 
+  html += `<div style="color:var(--dim);font-size:12px;margin-bottom:12px;cursor:help" title="${t('dataSource')}">📂 ${t('dataSource')}</div>`;
   html += '<div class="hero-grid">';
   html += `<div class="hero"><div class="label">${t('today')} ${t('incCache')}</div><div class="num" style="color:var(--cyan)">${h.today.total_tokens_fmt}</div><div class="sub">${h.today.requests} ${t('req')} &middot; ${h.today.output_fmt} ${t('output')}</div></div>`;
   html += `<div class="hero"><div class="label">${t('thisWeek')} ${t('incCache')}</div><div class="num" style="color:var(--cyan)">${h.week.total_tokens_fmt}</div><div class="sub">${h.week.requests} ${t('req')} &middot; ${h.week.output_fmt} ${t('output')}</div></div>`;
@@ -713,6 +719,7 @@ function renderModels() {
   if (!historyData || historyData.loading) return `<div class="empty">${t('loading')}</div>`;
   const h = historyData;
   let html = '';
+  html += `<div style="color:var(--dim);font-size:12px;margin-bottom:12px;cursor:help" title="${t('dataSource')}">📂 ${t('dataSource')}</div>`;
 
   // Hero
   html += '<div class="hero-grid">';

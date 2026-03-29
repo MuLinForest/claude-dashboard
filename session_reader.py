@@ -31,10 +31,11 @@ class Session:
     mem_kb: int
     cost_usd: float
     session_title: str
+    slug: str = ""
 
     @property
     def display_name(self) -> str:
-        return self.session_title or self.project_name
+        return self.session_title or self.slug or self.project_name
 
     @property
     def short_model(self) -> str:
@@ -111,6 +112,7 @@ def load_sessions(cleanup_dead: bool = True) -> list[Session]:
             mem_kb=int(data.get("mem_kb", 0)),
             cost_usd=float(data.get("cost_usd", 0)),
             session_title=data.get("session_title", ""),
+            slug=data.get("slug", ""),
         )
 
         if s.pid == 0:
