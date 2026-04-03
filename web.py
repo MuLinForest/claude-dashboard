@@ -16,11 +16,15 @@ from datetime import datetime, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 
-from session_reader import Session, load_sessions, fmt_tokens, fmt_mem, SESSIONS_DIR
+from session_reader import load_sessions, fmt_tokens, fmt_mem, SESSIONS_DIR
 from history_reader import load_history, HistoryStats, estimate_cost
 
 HOST = "0.0.0.0"
 PORT = 7878
+
+
+def _total_tokens(s: dict) -> int:
+    return s["input_tokens"] + s["output_tokens"] + s["cache_read"] + s["cache_write"]
 
 # ── Background history cache (loaded once, refreshed every 60s) ───────────────
 _history: HistoryStats | None = None
@@ -144,7 +148,12 @@ def session_detail(pid: int) -> dict:
     result["last_activity"] = last_activity
     result["cost_est"] = round(total_cost, 2)
 
-    _detail_cache[pid] = (now, result)
+    with _detail_lock:
+        # Cap cache size
+        if len(_detail_cache) > 50:
+            oldest = min(_detail_cache, key=lambda k: _detail_cache[k][0])
+            del _detail_cache[oldest]
+        _detail_cache[pid] = (now, result)
     return result
 
 
@@ -178,9 +187,6 @@ def history_json() -> dict:
         h = _history
     if h is None:
         return {"loading": True}
-
-    def _total_tokens(s: dict) -> int:
-        return s["input_tokens"] + s["output_tokens"] + s["cache_read"] + s["cache_write"]
 
     def _period(days: int) -> dict:
         s = h.by_period(days)
@@ -274,7 +280,26 @@ def history_json() -> dict:
         "projects": projects,
         "trend": trend,
         "sessions": sessions,
+        "blocks": _build_blocks(h),
     }
+
+
+def _build_blocks(h: HistoryStats) -> list[dict]:
+    blocks = []
+    for b in h.billing_blocks(5, 10):
+        tt = _total_tokens(b)
+        start = b["start"][:16].replace("T", " ")
+        end = b["end"][:16].replace("T", " ")
+        blocks.append({
+            "start": start,
+            "end": end,
+            "total_tokens": tt,
+            "total_tokens_fmt": fmt_tokens(tt),
+            "requests": b["requests"],
+            "cost": round(b["cost_usd"], 2),
+            "is_active": b["is_active"],
+        })
+    return blocks
 
 
 # ── HTML ──────────────────────────────────────────────────────────────────────
@@ -386,6 +411,7 @@ body { background: var(--bg); color: var(--text); font-family: -apple-system, Bl
 .card .row-bar { grid-template-columns: 100px 1fr 70px; }
 .card .row-bar .bar-bg { width: 100%; }
 .card .row-session { grid-template-columns: 1fr 90px 100px 70px 70px 60px; }
+.card .row-block { grid-template-columns: 120px 15px 120px 70px auto auto; }
 
 /* Tooltip */
 .tip { position: relative; cursor: help; border-bottom: 1px dotted var(--dim); }
@@ -467,6 +493,7 @@ const I18N = {
     tipModel: 'AI model used', tipBranch: 'Git branch', tipPid: 'Process ID', tipMem: 'Memory usage (RAM)', tipOutputTokens: 'Output tokens — response from Claude', tipCtx: 'Context window usage',
     nameSession: 'Session Name', nameSlug: 'Slug', nameProject: 'Project Name',
     dataSource: 'Data from local JSONL transcripts (~/.claude/projects/)',
+    billingBlocks: '5h Billing Blocks', active: 'ACTIVE',
   },
   'zh-TW': {
     sessions: '工作階段', usage: '用量', models: '模型',
@@ -487,6 +514,7 @@ const I18N = {
     tipModel: '使用的 AI 模型', tipBranch: 'Git 分支', tipPid: '程序 ID', tipMem: '記憶體用量 (RAM)', tipOutputTokens: 'Output tokens — Claude 的回應量', tipCtx: 'Context window 使用率',
     nameSession: '工作階段名稱', nameSlug: '自動名稱 (Slug)', nameProject: '專案名稱',
     dataSource: '資料來自本機 JSONL 對話紀錄 (~/.claude/projects/)',
+    billingBlocks: '5 小時計費區間', active: '進行中',
   }
 };
 let lang = localStorage.getItem('lang') || 'en';
@@ -686,6 +714,17 @@ function renderUsage() {
     }
   }
   html += '</div>';
+
+  // 5h Billing Blocks
+  if (h.blocks && h.blocks.length) {
+    html += `<div class="card" style="margin-bottom:20px"><h3>${t('billingBlocks')}</h3>`;
+    for (const b of [...h.blocks].reverse()) {
+      const activeTag = b.is_active ? `<span class="status status-working" style="font-size:10px;margin-left:8px">${t('active')}</span>` : '';
+      html += `<div class="row row-block"><span class="meta">${b.start}</span><span class="meta">~</span><span class="meta">${b.end}</span><span class="val">${b.total_tokens_fmt}</span><span class="meta">${b.requests} ${t('req')}</span>${activeTag}</div>`;
+    }
+    html += '</div>';
+  }
+
   return html;
 }
 
@@ -895,10 +934,8 @@ async function pollSessions() {
   }
 }
 
-let historyVersion = 0;
 async function pollHistory() {
   await fetchHistory();
-  historyVersion++;
   if (currentTab !== 'sessions') render();
 }
 

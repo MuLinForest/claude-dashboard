@@ -97,12 +97,16 @@ def load_sessions(cleanup_dead: bool = True) -> list[Session]:
             else:
                 status = "working"
 
+        cwd = data.get("project_dir") or data.get("cwd", "")
+        started = data.get("startedAt", 0)
+        epoch = int(data.get("epoch", 0)) or (int(started / 1000) if started else 0)
+
         s = Session(
             pid=pid,
-            epoch=int(data.get("epoch", 0)),
+            epoch=epoch,
             model=data.get("model", "Unknown"),
-            project_dir=data.get("project_dir", ""),
-            project_name=data.get("project_name", "unknown"),
+            project_dir=cwd,
+            project_name=data.get("project_name") or data.get("name") or (os.path.basename(cwd) if cwd else "unknown"),
             git_branch=data.get("git_branch", ""),
             status=status,
             last_activity=data.get("last_activity", ""),
