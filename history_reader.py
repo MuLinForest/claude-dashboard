@@ -133,6 +133,10 @@ class HistoryStats:
         cutoff = since.strftime("%Y-%m-%d")
         return [r for r in self.records if r.date >= cutoff]
 
+    def _filter_range(self, from_date: str, to_date: str) -> list[UsageRecord]:
+        """Filter records by date range (YYYY-MM-DD strings, inclusive)."""
+        return [r for r in self.records if from_date <= r.date <= to_date]
+
     def _sum(self, recs: list[UsageRecord]) -> dict:
         total_in = sum(r.input_tokens for r in recs)
         total_out = sum(r.output_tokens for r in recs)
@@ -208,6 +212,118 @@ class HistoryStats:
             d = (today - timedelta(days=i)).strftime("%Y-%m-%d")
             result.append((d, self._sum(by_date.get(d, []))))
         return result
+
+    # ── Range-aware methods ──────────────────────────────────────────────────
+    def by_range(self, from_date: str, to_date: str) -> dict:
+        """Sum stats for a date range (YYYY-MM-DD, inclusive)."""
+        return self._sum(self._filter_range(from_date, to_date))
+
+    def by_model_range(self, from_date: str, to_date: str) -> dict[str, dict]:
+        groups: dict[str, list[UsageRecord]] = defaultdict(list)
+        for r in self._filter_range(from_date, to_date):
+            groups[r.model].append(r)
+        return {m: self._sum(rs) for m, rs in sorted(groups.items())}
+
+    def by_project_range(self, from_date: str, to_date: str) -> dict[str, dict]:
+        groups: dict[str, list[UsageRecord]] = defaultdict(list)
+        for r in self._filter_range(from_date, to_date):
+            groups[r.project].append(r)
+        return {
+            p: self._sum(rs)
+            for p, rs in sorted(groups.items(), key=lambda x: -sum(r.cost_usd for r in x[1]))
+        }
+
+    def by_session_range(self, from_date: str, to_date: str) -> list[dict]:
+        groups: dict[str, list[UsageRecord]] = defaultdict(list)
+        for r in self._filter_range(from_date, to_date):
+            if r.session_id:
+                groups[r.session_id].append(r)
+        result = []
+        for sid, rs in groups.items():
+            s = self._sum(rs)
+            date_list = [r.date for r in rs]
+            title = next((r.session_title for r in rs if r.session_title), "")
+            project = next((r.project for r in rs if r.project), "unknown")
+            result.append({
+                **s,
+                "session_id": sid,
+                "title": title or sid[:8],
+                "project": project,
+                "date_start": min(date_list) if date_list else "",
+                "date_end": max(date_list) if date_list else "",
+            })
+        result.sort(key=lambda x: -x["cost_usd"])
+        return result
+
+    def daily_trend_range(self, from_date: str, to_date: str) -> list[tuple[str, dict]]:
+        """Returns list of (date_str, stats_dict) for a date range, oldest first."""
+        from datetime import date as date_cls
+        start = date_cls.fromisoformat(from_date)
+        end = date_cls.fromisoformat(to_date)
+        num_days = (end - start).days + 1
+
+        by_date: dict[str, list[UsageRecord]] = defaultdict(list)
+        for r in self._filter_range(from_date, to_date):
+            by_date[r.date].append(r)
+
+        result = []
+        for i in range(num_days):
+            d = (start + timedelta(days=i)).strftime("%Y-%m-%d")
+            result.append((d, self._sum(by_date.get(d, []))))
+        return result
+
+    def billing_blocks_range(self, from_date: str, to_date: str, hours: int = 5, recent: int = 20) -> list[dict]:
+        """Group records within date range into 5h billing windows."""
+        recs = self._filter_range(from_date, to_date)
+        if not recs:
+            return []
+
+        BLOCK_SEC = hours * 3600
+        now = datetime.now(timezone.utc)
+
+        timed: list[tuple[datetime, UsageRecord]] = []
+        for r in recs:
+            if not r.timestamp:
+                continue
+            try:
+                dt = datetime.fromisoformat(r.timestamp.replace("Z", "+00:00"))
+                timed.append((dt, r))
+            except (ValueError, AttributeError):
+                continue
+        timed.sort(key=lambda x: x[0])
+
+        blocks: list[dict] = []
+        block_start: datetime | None = None
+        block_recs: list[UsageRecord] = []
+
+        for dt, r in timed:
+            if block_start is None:
+                block_start = dt.replace(minute=0, second=0, microsecond=0)
+                block_recs = [r]
+            elif (dt - block_start).total_seconds() > BLOCK_SEC:
+                s = self._sum(block_recs)
+                blocks.append({
+                    **s,
+                    "start": block_start.isoformat(),
+                    "end": (block_start + timedelta(seconds=BLOCK_SEC)).isoformat(),
+                    "is_active": False,
+                })
+                block_start = dt.replace(minute=0, second=0, microsecond=0)
+                block_recs = [r]
+            else:
+                block_recs.append(r)
+
+        if block_start and block_recs:
+            end = block_start + timedelta(seconds=BLOCK_SEC)
+            s = self._sum(block_recs)
+            blocks.append({
+                **s,
+                "start": block_start.isoformat(),
+                "end": end.isoformat(),
+                "is_active": now < end,
+            })
+
+        return blocks[-recent:]
 
     def billing_blocks(self, hours: int = 5, recent: int = 10) -> list[dict]:
         """Group records into 5h billing windows. Returns most recent blocks."""

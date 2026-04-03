@@ -12,12 +12,13 @@ import signal
 import subprocess
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta, date as date_cls
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
+from urllib.parse import urlparse, parse_qs
 
 from session_reader import load_sessions, fmt_tokens, fmt_mem, SESSIONS_DIR
-from history_reader import load_history, HistoryStats, estimate_cost
+from history_reader import load_history, HistoryStats, estimate_cost, PROJECTS_DIR
 
 HOST = "0.0.0.0"
 PORT = 7878
@@ -302,6 +303,245 @@ def _build_blocks(h: HistoryStats) -> list[dict]:
     return blocks
 
 
+def _build_blocks_range(h: HistoryStats, from_date: str, to_date: str) -> list[dict]:
+    blocks = []
+    for b in h.billing_blocks_range(from_date, to_date):
+        tt = _total_tokens(b)
+        start = b["start"][:16].replace("T", " ")
+        end = b["end"][:16].replace("T", " ")
+        blocks.append({
+            "start": start,
+            "end": end,
+            "total_tokens": tt,
+            "total_tokens_fmt": fmt_tokens(tt),
+            "requests": b["requests"],
+            "cost": round(b["cost_usd"], 2),
+            "is_active": b["is_active"],
+        })
+    return blocks
+
+
+def history_json_range(from_date: str, to_date: str) -> dict:
+    """Return history data filtered to [from_date, to_date] (YYYY-MM-DD)."""
+    with _history_lock:
+        h = _history
+    if h is None:
+        return {"loading": True}
+
+    def _fmt_sum(s: dict) -> dict:
+        total = _total_tokens(s)
+        return {
+            "cost": round(s["cost_usd"], 2),
+            "input": s["input_tokens"],
+            "input_fmt": fmt_tokens(s["input_tokens"]),
+            "output": s["output_tokens"],
+            "output_fmt": fmt_tokens(s["output_tokens"]),
+            "total_tokens": total,
+            "total_tokens_fmt": fmt_tokens(total),
+            "requests": s["requests"],
+        }
+
+    range_sum = _fmt_sum(h.by_range(from_date, to_date))
+
+    models = []
+    by_model = h.by_model_range(from_date, to_date)
+    total_tokens_all = sum(_total_tokens(s) for s in by_model.values()) or 1
+    for model, s in by_model.items():
+        tt = _total_tokens(s)
+        avg = tt // s["requests"] if s["requests"] else 0
+        models.append({
+            "model": model,
+            "cost": round(s["cost_usd"], 2),
+            "input": s["input_tokens"],
+            "input_fmt": fmt_tokens(s["input_tokens"]),
+            "output": s["output_tokens"],
+            "output_fmt": fmt_tokens(s["output_tokens"]),
+            "cache_read": s["cache_read"],
+            "cache_read_fmt": fmt_tokens(s["cache_read"]),
+            "cache_write": s["cache_write"],
+            "cache_write_fmt": fmt_tokens(s["cache_write"]),
+            "total_tokens": tt,
+            "total_tokens_fmt": fmt_tokens(tt),
+            "requests": s["requests"],
+            "pct": round(tt / total_tokens_all * 100, 1),
+            "avg_tokens": avg,
+            "avg_tokens_fmt": fmt_tokens(avg),
+            "input_pct": round(s["input_tokens"] / tt * 100, 1) if tt else 0,
+            "output_pct": round(s["output_tokens"] / tt * 100, 1) if tt else 0,
+            "cache_read_pct": round(s["cache_read"] / tt * 100, 1) if tt else 0,
+            "cache_write_pct": round(s["cache_write"] / tt * 100, 1) if tt else 0,
+        })
+
+    projects = []
+    for proj, s in list(h.by_project_range(from_date, to_date).items())[:10]:
+        tt = _total_tokens(s)
+        projects.append({
+            "project": proj,
+            "cost": round(s["cost_usd"], 2),
+            "total_tokens": tt,
+            "total_tokens_fmt": fmt_tokens(tt),
+            "requests": s["requests"],
+        })
+
+    trend = []
+    daily = h.daily_trend_range(from_date, to_date)
+    max_tokens = max((_total_tokens(s) for _, s in daily), default=1) or 1
+    for date_str, s in daily:
+        tt = _total_tokens(s)
+        trend.append({
+            "date": date_str[5:],
+            "cost": round(s["cost_usd"], 2),
+            "tokens": tt,
+            "tokens_fmt": fmt_tokens(tt),
+            "pct": round(tt / max_tokens * 100),
+        })
+
+    sessions = []
+    for s in h.by_session_range(from_date, to_date)[:15]:
+        tt = _total_tokens(s)
+        sessions.append({
+            "title": s["title"],
+            "project": s["project"],
+            "cost": round(s["cost_usd"], 2),
+            "total_tokens": tt,
+            "total_tokens_fmt": fmt_tokens(tt),
+            "input_fmt": fmt_tokens(s["input_tokens"]),
+            "output_fmt": fmt_tokens(s["output_tokens"]),
+            "cache_read_fmt": fmt_tokens(s["cache_read"]),
+            "cache_write_fmt": fmt_tokens(s["cache_write"]),
+            "requests": s["requests"],
+            "dates": f"{s['date_start'][5:]} ~ {s['date_end'][5:]}" if s["date_start"] else "",
+        })
+
+    return {
+        "range": range_sum,
+        "from": from_date,
+        "to": to_date,
+        "models": models,
+        "projects": projects,
+        "trend": trend,
+        "sessions": sessions,
+        "blocks": _build_blocks_range(h, from_date, to_date),
+    }
+
+
+# ── Timeline API ─────────────────────────────────────────────────────────────
+_timeline_cache: tuple[float, list] = (0.0, [])
+_timeline_lock = threading.Lock()
+TIMELINE_TTL = 30
+ACTIVITY_GAP_SEC = 300  # 5 minutes — gap longer than this = idle
+
+
+def _scan_jsonl_timestamps(jsonl_path: Path, since_ts: float) -> list[float]:
+    """Extract assistant-message timestamps from a JSONL file, after since_ts."""
+    timestamps: list[float] = []
+    try:
+        for line in jsonl_path.read_text(errors="ignore").splitlines():
+            try:
+                d = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if d.get("type") != "assistant":
+                continue
+            ts = d.get("timestamp", "")
+            if not ts:
+                continue
+            try:
+                dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                epoch = dt.timestamp()
+                if epoch >= since_ts:
+                    timestamps.append(epoch)
+            except (ValueError, AttributeError):
+                continue
+    except OSError:
+        pass
+    return timestamps
+
+
+def _timestamps_to_segments(timestamps: list[float], window_start: float, window_end: float) -> list[dict]:
+    """Convert sorted timestamps into active/idle segments."""
+    if not timestamps:
+        return [{"start": window_start, "end": window_end, "type": "idle"}]
+
+    timestamps.sort()
+    segments: list[dict] = []
+
+    # Add idle gap before first activity
+    if timestamps[0] - window_start > ACTIVITY_GAP_SEC:
+        segments.append({"start": window_start, "end": timestamps[0], "type": "idle"})
+
+    # Group timestamps into active windows
+    seg_start = timestamps[0]
+    seg_end = timestamps[0]
+
+    for ts in timestamps[1:]:
+        if ts - seg_end > ACTIVITY_GAP_SEC:
+            # Close current active segment
+            segments.append({"start": seg_start, "end": seg_end + 60, "type": "active"})
+            # Add idle gap
+            segments.append({"start": seg_end + 60, "end": ts, "type": "idle"})
+            seg_start = ts
+            seg_end = ts
+        else:
+            seg_end = ts
+
+    # Close last active segment
+    segments.append({"start": seg_start, "end": min(seg_end + 60, window_end), "type": "active"})
+
+    # Add idle gap after last activity
+    if seg_end + 60 < window_end:
+        segments.append({"start": seg_end + 60, "end": window_end, "type": "idle"})
+
+    return segments
+
+
+def timeline_json() -> list[dict]:
+    """Return activity timeline for each active session over the last 24h."""
+    global _timeline_cache
+    now = time.time()
+    with _timeline_lock:
+        cached_ts, cached_data = _timeline_cache
+        if now - cached_ts < TIMELINE_TTL:
+            return cached_data
+
+    sessions = load_sessions(cleanup_dead=False)
+    alive = [s for s in sessions if s.is_alive]
+
+    window_end = now
+    window_start = now - 86400  # 24 hours ago
+
+    result: list[dict] = []
+    for s in alive:
+        # Find the JSONL for this session's project
+        jsonl = _find_jsonl(s.project_dir)
+        if not jsonl:
+            result.append({
+                "pid": s.pid,
+                "name": s.display_name,
+                "status": s.status,
+                "segments": [{"start": window_start, "end": window_end, "type": "idle"}],
+            })
+            continue
+
+        timestamps = _scan_jsonl_timestamps(jsonl, window_start)
+        segments = _timestamps_to_segments(timestamps, window_start, window_end)
+
+        result.append({
+            "pid": s.pid,
+            "name": s.display_name,
+            "status": s.status,
+            "segments": [
+                {"start": round(seg["start"], 1), "end": round(seg["end"], 1), "type": seg["type"]}
+                for seg in segments
+            ],
+        })
+
+    with _timeline_lock:
+        _timeline_cache = (now, result)
+
+    return result
+
+
 # ── HTML ──────────────────────────────────────────────────────────────────────
 HTML = r"""<!DOCTYPE html>
 <html lang="zh-TW">
@@ -441,6 +681,49 @@ body { background: var(--bg); color: var(--text); font-family: -apple-system, Bl
 .empty { color: var(--dim); text-align: center; padding: 80px 20px; font-size: 15px; }
 .pct-ok { color: var(--green); } .pct-warn { color: var(--yellow); } .pct-danger { color: var(--red); font-weight: 700; }
 
+/* Context alert glow */
+.session.ctx-alert { border-color: var(--red); box-shadow: 0 0 12px rgba(248,113,113,.45), 0 0 24px rgba(248,113,113,.2); animation: ctxPulse 2s ease-in-out infinite; }
+@keyframes ctxPulse { 0%,100% { box-shadow: 0 0 12px rgba(248,113,113,.45), 0 0 24px rgba(248,113,113,.2); } 50% { box-shadow: 0 0 18px rgba(248,113,113,.6), 0 0 36px rgba(248,113,113,.3); } }
+[data-theme="light"] .session.ctx-alert { box-shadow: 0 0 12px rgba(220,38,38,.3), 0 0 24px rgba(220,38,38,.15); }
+
+/* Notification bell */
+.notify-btn { background: var(--surface2); border: 1px solid var(--border); color: var(--dim); width: 36px; height: 36px; border-radius: 8px; cursor: pointer; font-size: 16px; display: flex; align-items: center; justify-content: center; transition: all .2s; position: relative; }
+.notify-btn:hover { color: var(--accent); border-color: var(--accent); transform: translateY(-1px); }
+.notify-btn.granted { color: var(--green); }
+.notify-btn.denied { color: var(--red); opacity: .6; }
+
+/* Timeline */
+.timeline-container { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 20px; box-shadow: var(--shadow); }
+.timeline-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; }
+.timeline-header h3 { color: var(--accent); font-size: 11px; text-transform: uppercase; letter-spacing: 1.5px; font-weight: 600; margin: 0; }
+.timeline-hours { position: relative; height: 24px; margin-left: 160px; margin-bottom: 4px; border-bottom: 1px solid var(--border); }
+.timeline-hour-mark { position: absolute; top: 0; font-size: 10px; color: var(--dim); font-family: 'JetBrains Mono', monospace; transform: translateX(-50%); }
+.timeline-row { display: flex; align-items: center; margin-bottom: 6px; height: 32px; }
+.timeline-label { width: 150px; min-width: 150px; padding-right: 10px; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.timeline-label .tl-name { font-weight: 500; }
+.timeline-label .tl-status { font-size: 10px; margin-left: 6px; }
+.timeline-bar-wrap { flex: 1; height: 20px; position: relative; background: var(--surface2); border-radius: 4px; overflow: hidden; border: 1px solid var(--border); }
+.timeline-seg { position: absolute; top: 0; height: 100%; }
+.timeline-seg-active { background: var(--yellow); opacity: 0.85; border-radius: 2px; }
+.timeline-seg-idle { background: transparent; }
+.timeline-now { position: absolute; top: 0; height: 100%; width: 2px; background: var(--red); z-index: 2; }
+.timeline-now::after { content: ''; position: absolute; top: -4px; left: -3px; width: 8px; height: 8px; background: var(--red); border-radius: 50%; }
+.timeline-legend { display: flex; gap: 16px; margin-top: 14px; font-size: 11px; color: var(--dim); }
+.timeline-legend span { display: flex; align-items: center; gap: 5px; }
+.timeline-legend .leg-box { width: 14px; height: 10px; border-radius: 2px; display: inline-block; }
+
+/* Date range picker */
+.date-range { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 16px; padding: 14px 18px; background: var(--surface); border: 1px solid var(--border); border-radius: 12px; box-shadow: var(--shadow); }
+.date-range label { color: var(--dim); font-size: 12px; font-weight: 500; letter-spacing: .3px; }
+.date-range input[type="date"] { background: var(--surface2); border: 1px solid var(--border); color: var(--text); padding: 5px 10px; border-radius: 6px; font-size: 12px; font-family: 'JetBrains Mono', monospace; outline: none; transition: border-color .2s; }
+.date-range input[type="date"]:focus { border-color: var(--accent); }
+.date-range input[type="date"]::-webkit-calendar-picker-indicator { filter: invert(.6); }
+[data-theme="light"] .date-range input[type="date"]::-webkit-calendar-picker-indicator { filter: none; }
+.date-presets { display: flex; gap: 4px; margin-left: 8px; }
+.date-preset { background: var(--surface2); border: 1px solid var(--border); color: var(--dim); padding: 4px 12px; border-radius: 6px; cursor: pointer; font-size: 11px; font-family: inherit; font-weight: 500; transition: all .2s; }
+.date-preset:hover { color: var(--accent); border-color: var(--accent); }
+.date-preset.active { color: var(--accent); border-color: var(--accent); background: color-mix(in srgb, var(--accent) 10%, var(--surface2)); }
+
 @media (max-width: 768px) {
   .hero-grid { grid-template-columns: 1fr; }
   .grid2 { grid-template-columns: 1fr; }
@@ -449,6 +732,10 @@ body { background: var(--bg); color: var(--text); font-family: -apple-system, Bl
   .tabs { padding: 0 16px; }
   .tab { padding: 10px 14px; font-size: 12px; }
   .bar-bg { width: 120px; }
+  .timeline-label { width: 100px; min-width: 100px; font-size: 11px; }
+  .timeline-hours { margin-left: 110px; }
+  .date-range { padding: 10px 12px; gap: 6px; }
+  .date-presets { margin-left: 0; }
 }
 </style>
 </head>
@@ -458,6 +745,7 @@ body { background: var(--bg); color: var(--text); font-family: -apple-system, Bl
   <h1>Claude Dashboard</h1>
   <span class="time" id="clock"></span>
   <div class="header-right">
+    <button class="notify-btn" id="notifyToggle" title="">&#128276;</button>
     <button class="theme-btn" id="langToggle"></button>
     <button class="theme-btn" id="themeToggle"></button>
   </div>
@@ -465,6 +753,7 @@ body { background: var(--bg); color: var(--text); font-family: -apple-system, Bl
 
 <div class="tabs">
   <div class="tab active" data-tab="sessions">Sessions</div>
+  <div class="tab" data-tab="timeline">Timeline</div>
   <div class="tab" data-tab="usage">Usage</div>
   <div class="tab" data-tab="models">Models</div>
 </div>
@@ -494,6 +783,18 @@ const I18N = {
     nameSession: 'Session Name', nameSlug: 'Slug', nameProject: 'Project Name',
     dataSource: 'Data from local JSONL transcripts (~/.claude/projects/)',
     billingBlocks: '5h Billing Blocks', active: 'ACTIVE',
+    notifyPermission: 'Enable desktop notifications',
+    notifyGranted: 'Notifications enabled',
+    notifyDenied: 'Notifications blocked by browser',
+    ctxAlert: 'Context window alert',
+    ctxAlertBody: '{name} has reached {pct}% context usage',
+    timeline: 'Timeline', timelineTitle: 'Session Activity (24h)',
+    tlActive: 'Active', tlIdle: 'Idle', tlNow: 'Now',
+    tlNoSessions: 'No active sessions to display.',
+    dateFrom: 'From', dateTo: 'To',
+    presetToday: 'Today', preset7d: '7d', preset30d: '30d', preset90d: '90d', presetAll: 'All',
+    dateRange: 'Date Range', dailyTokensRange: 'Daily Tokens', byProjectRange: 'By Project', bySessionRange: 'By Session',
+    selectedRange: 'Selected Range',
   },
   'zh-TW': {
     sessions: '工作階段', usage: '用量', models: '模型',
@@ -515,6 +816,18 @@ const I18N = {
     nameSession: '工作階段名稱', nameSlug: '自動名稱 (Slug)', nameProject: '專案名稱',
     dataSource: '資料來自本機 JSONL 對話紀錄 (~/.claude/projects/)',
     billingBlocks: '5 小時計費區間', active: '進行中',
+    notifyPermission: '啟用桌面通知',
+    notifyGranted: '通知已啟用',
+    notifyDenied: '瀏覽器已封鎖通知',
+    ctxAlert: 'Context window 警報',
+    ctxAlertBody: '{name} 已達 {pct}% context 使用率',
+    timeline: '時間軸', timelineTitle: '工作階段活動 (24小時)',
+    tlActive: '活躍', tlIdle: '閒置', tlNow: '現在',
+    tlNoSessions: '沒有可顯示的活躍工作階段。',
+    dateFrom: '從', dateTo: '到',
+    presetToday: '今天', preset7d: '7天', preset30d: '30天', preset90d: '90天', presetAll: '全部',
+    dateRange: '日期範圍', dailyTokensRange: '每日 Token', byProjectRange: '依專案', bySessionRange: '依工作階段',
+    selectedRange: '選取範圍',
   }
 };
 let lang = localStorage.getItem('lang') || 'en';
@@ -527,12 +840,13 @@ langBtn.onclick = () => {
   lang = lang === 'en' ? 'zh-TW' : 'en';
   localStorage.setItem('lang', lang);
   updateLangBtn();
+  updateNotifyBtn();
   updateTabs();
   render();
 };
 
 function updateTabs() {
-  const keys = ['sessions', 'usage', 'models'];
+  const keys = ['sessions', 'timeline', 'usage', 'models'];
   document.querySelectorAll('.tab').forEach((el, i) => { el.textContent = t(keys[i]); });
 }
 updateTabs();
@@ -553,10 +867,45 @@ themeBtn.onclick = () => {
 
 function cs() { return getComputedStyle(document.documentElement); }
 
-const VALID_TABS = ['sessions', 'usage', 'models'];
+const VALID_TABS = ['sessions', 'timeline', 'usage', 'models'];
 let currentTab = VALID_TABS.includes(location.hash.slice(1)) ? location.hash.slice(1) : 'sessions';
-let sessionsData = [], historyData = null;
+let sessionsData = [], historyData = null, rangeHistoryData = null;
 let costChart = null, modelChart = null;
+
+// ── Date range state ──────────────────────────────
+function fmtDate(d) { return d.toISOString().slice(0, 10); }
+const _today = new Date();
+const _30ago = new Date(_today); _30ago.setDate(_30ago.getDate() - 30);
+let dateFrom = fmtDate(_30ago);
+let dateTo = fmtDate(_today);
+let activePreset = '30d';
+
+async function fetchRangeHistory() {
+  try {
+    rangeHistoryData = await (await fetch('/api/history?from=' + dateFrom + '&to=' + dateTo)).json();
+  } catch {}
+}
+
+function setDateRange(from, to, preset) {
+  dateFrom = from;
+  dateTo = to;
+  activePreset = preset || '';
+  fetchRangeHistory().then(() => {
+    if (currentTab === 'usage' || currentTab === 'models') render();
+  });
+}
+
+function applyPreset(key) {
+  const today = new Date();
+  let from;
+  if (key === 'today') { from = new Date(today); }
+  else if (key === '7d') { from = new Date(today); from.setDate(from.getDate() - 7); }
+  else if (key === '30d') { from = new Date(today); from.setDate(from.getDate() - 30); }
+  else if (key === '90d') { from = new Date(today); from.setDate(from.getDate() - 90); }
+  else if (key === 'all') { from = new Date('2024-01-01'); }
+  else return;
+  setDateRange(fmtDate(from), fmtDate(today), key);
+}
 
 function switchTab(tab) {
   currentTab = tab;
@@ -577,8 +926,59 @@ document.querySelectorAll('.tab').forEach(x => x.classList.toggle('active', x.da
 function updateClock() { document.getElementById('clock').textContent = new Date().toLocaleString('sv-SE'); }
 setInterval(updateClock, 1000); updateClock();
 
+// ── Notifications ─────────────────────────────────
+const CTX_THRESHOLD = 80;
+const notifiedPids = new Set();
+const notifyBtn = document.getElementById('notifyToggle');
+
+function updateNotifyBtn() {
+  if (!('Notification' in window)) { notifyBtn.style.display = 'none'; return; }
+  const perm = Notification.permission;
+  notifyBtn.classList.toggle('granted', perm === 'granted');
+  notifyBtn.classList.toggle('denied', perm === 'denied');
+  notifyBtn.title = perm === 'granted' ? t('notifyGranted') : perm === 'denied' ? t('notifyDenied') : t('notifyPermission');
+}
+updateNotifyBtn();
+
+notifyBtn.onclick = async () => {
+  if (!('Notification' in window)) return;
+  if (Notification.permission === 'default') {
+    await Notification.requestPermission();
+  }
+  updateNotifyBtn();
+};
+
+function checkCtxAlerts(sessions) {
+  // Apply/remove glow class on session cards
+  for (const s of sessions) {
+    const card = document.getElementById('session-' + s.pid);
+    if (card) card.classList.toggle('ctx-alert', s.used_pct >= CTX_THRESHOLD);
+  }
+
+  // Send browser notifications for newly crossed thresholds
+  if (!('Notification' in window) || Notification.permission !== 'granted') return;
+  for (const s of sessions) {
+    if (s.used_pct >= CTX_THRESHOLD && !notifiedPids.has(s.pid)) {
+      notifiedPids.add(s.pid);
+      const body = t('ctxAlertBody').replace('{name}', s.name).replace('{pct}', s.used_pct);
+      new Notification(t('ctxAlert'), { body, tag: 'ctx-' + s.pid });
+    }
+    // Reset if drops below threshold so it can re-notify on next crossing
+    if (s.used_pct < CTX_THRESHOLD) notifiedPids.delete(s.pid);
+  }
+
+  // Clean up PIDs for sessions that no longer exist
+  const activePids = new Set(sessions.map(s => s.pid));
+  for (const pid of notifiedPids) {
+    if (!activePids.has(pid)) notifiedPids.delete(pid);
+  }
+}
+
 async function fetchSessions() { try { sessionsData = await (await fetch('/api/sessions')).json(); } catch {} }
-async function fetchHistory() { try { historyData = await (await fetch('/api/history')).json(); } catch {} }
+async function fetchHistory() {
+  try { historyData = await (await fetch('/api/history')).json(); } catch {}
+  try { rangeHistoryData = await (await fetch('/api/history?from=' + dateFrom + '&to=' + dateTo)).json(); } catch {}
+}
 
 function barClass(p) { return p < 60 ? 'bar-ok' : p < 85 ? 'bar-warn' : 'bar-danger'; }
 function pctClass(p) { return p < 60 ? 'pct-ok' : p < 85 ? 'pct-warn' : 'pct-danger'; }
@@ -685,40 +1085,81 @@ function patchSessions() {
 }
 
 // ── Usage ─────────────────────────────────────────
+function datePickerHtml() {
+  const presets = [
+    ['today', t('presetToday')], ['7d', t('preset7d')], ['30d', t('preset30d')],
+    ['90d', t('preset90d')], ['all', t('presetAll')]
+  ];
+  let html = '<div class="date-range">';
+  html += `<label>${t('dateFrom')}</label>`;
+  html += `<input type="date" id="dateFrom" value="${dateFrom}" onchange="onDateInputChange()">`;
+  html += `<label>${t('dateTo')}</label>`;
+  html += `<input type="date" id="dateTo" value="${dateTo}" onchange="onDateInputChange()">`;
+  html += '<div class="date-presets">';
+  for (const [key, label] of presets) {
+    html += `<button class="date-preset${activePreset === key ? ' active' : ''}" onclick="applyPreset('${key}')">${label}</button>`;
+  }
+  html += '</div></div>';
+  return html;
+}
+
+function onDateInputChange() {
+  const fromEl = document.getElementById('dateFrom');
+  const toEl = document.getElementById('dateTo');
+  if (fromEl && toEl && fromEl.value && toEl.value) {
+    setDateRange(fromEl.value, toEl.value, '');
+  }
+}
+
 function renderUsage() {
   if (!historyData || historyData.loading) return `<div class="empty">${t('loading')}</div>`;
-  const h = historyData, s = cs();
+  const h = historyData;
+  const r = rangeHistoryData && !rangeHistoryData.loading ? rangeHistoryData : null;
   let html = '';
 
   html += `<div style="color:var(--dim);font-size:12px;margin-bottom:12px;cursor:help" title="${t('dataSource')}">📂 ${t('dataSource')}</div>`;
+
+  // Date range picker
+  html += datePickerHtml();
+
+  // Hero: today + week are always fixed; third card shows filtered range
+  const rangeStats = r ? r.range : h.month;
+  const rangeLabel = r ? t('selectedRange') : t('thisMonth');
   html += '<div class="hero-grid">';
   html += `<div class="hero"><div class="label">${t('today')} ${t('incCache')}</div><div class="num" style="color:var(--cyan)">${h.today.total_tokens_fmt}</div><div class="sub">${h.today.requests} ${t('req')} &middot; ${h.today.output_fmt} ${t('output')}</div></div>`;
   html += `<div class="hero"><div class="label">${t('thisWeek')} ${t('incCache')}</div><div class="num" style="color:var(--cyan)">${h.week.total_tokens_fmt}</div><div class="sub">${h.week.requests} ${t('req')} &middot; ${h.week.output_fmt} ${t('output')}</div></div>`;
-  html += `<div class="hero"><div class="label">${t('thisMonth')} ${t('incCache')}</div><div class="num" style="color:var(--accent)">${h.month.total_tokens_fmt}</div><div class="sub">${h.month.requests} ${t('req')} &middot; ${h.month.output_fmt} ${t('output')}</div></div>`;
+  html += `<div class="hero"><div class="label">${rangeLabel} ${t('incCache')}</div><div class="num" style="color:var(--accent)">${rangeStats.total_tokens_fmt}</div><div class="sub">${rangeStats.requests} ${t('req')} &middot; ${rangeStats.output_fmt} ${t('output')}</div></div>`;
   html += '</div>';
 
+  // Below here: use range-filtered data
+  const projects = r ? r.projects : h.projects;
+  const projTotal = rangeStats.total_tokens || 1;
+
   html += '<div class="grid2">';
-  html += `<div class="card"><h3>${t('dailyTokens')}</h3><div class="chart-wrap"><canvas id="costChart"></canvas></div></div>`;
-  html += `<div class="card"><h3>${t('byProject')}</h3>`;
-  for (const p of h.projects) {
-    const pct = h.month.total_tokens > 0 ? (p.total_tokens / h.month.total_tokens * 100) : 0;
+  html += `<div class="card"><h3>${t('dailyTokensRange')}</h3><div class="chart-wrap"><canvas id="costChart"></canvas></div></div>`;
+  html += `<div class="card"><h3>${t('byProjectRange')}</h3>`;
+  for (const p of projects) {
+    const pct = projTotal > 0 ? (p.total_tokens / projTotal * 100) : 0;
     html += `<div class="row row-bar"><span class="label">${esc(p.project)}</span><div class="bar-bg"><div class="bar-fill bar-ok" style="width:${pct}%"></div></div><span class="val">${p.total_tokens_fmt}</span></div>`;
   }
   html += '</div></div>';
 
-  html += `<div class="card" style="margin-bottom:20px"><h3>${t('bySession')}</h3>`;
+  const sessionsList = r ? r.sessions : h.sessions;
+  const blocks = r ? r.blocks : h.blocks;
+
+  html += `<div class="card" style="margin-bottom:20px"><h3>${t('bySessionRange')}</h3>`;
   html += `<div class="row row-session" style="border-bottom:1px solid var(--border);padding-bottom:6px;margin-bottom:4px"><span class="meta" style="font-weight:600;text-align:left">${t('hdrSession')}</span><span class="meta" style="font-weight:600">${t('hdrProject')}</span><span class="meta" style="font-weight:600">${t('hdrDate')}</span><span class="meta" style="font-weight:600">${t('output')}</span><span class="meta tip" style="font-weight:600">${t('total')}<span class="tiptext"><div class="trow"><span class="tlabel">${t('output')}</span><span class="trate">${t('tipOutput')}</span></div><div class="trow"><span class="tlabel">${t('input')}</span><span class="trate">${t('tipInput')}</span></div><div class="trow"><span class="tlabel">${t('cacheRead')}</span><span class="trate">${t('tipCacheRead')}</span></div><div class="trow"><span class="tlabel">${t('cacheWrite')}</span><span class="trate">${t('tipCacheWrite')}</span></div></span></span><span class="meta" style="font-weight:600">${t('estCost')}</span></div>`;
-  if (h.sessions) {
-    for (const s of h.sessions) {
+  if (sessionsList) {
+    for (const s of sessionsList) {
       html += `<div class="row row-session"><span class="label">${esc(s.title)}</span><span class="val">${esc(s.project)}</span><span class="meta">${s.dates}</span><span class="val">${s.output_fmt}</span><span class="tip val">${s.total_tokens_fmt}<span class="tiptext"><div class="trow"><span class="tlabel">${t('output')}</span><span class="tval">${s.output_fmt}</span></div><div class="trow"><span class="tlabel">${t('input')}</span><span class="tval">${s.input_fmt}</span><span class="trate">1x</span></div><div class="trow"><span class="tlabel">${t('cacheRead')}</span><span class="tval">${s.cache_read_fmt}</span><span class="trate">0.1x</span></div><div class="trow"><span class="tlabel">${t('cacheWrite')}</span><span class="tval">${s.cache_write_fmt}</span><span class="trate">1.25x</span></div><div class="tsep"></div><div class="trow"><span class="tlabel">${t('total')}</span><span class="tval">${s.total_tokens_fmt}</span></div></span></span><span class="meta">~$${s.cost.toFixed(0)} USD</span></div>`;
     }
   }
   html += '</div>';
 
   // 5h Billing Blocks
-  if (h.blocks && h.blocks.length) {
+  if (blocks && blocks.length) {
     html += `<div class="card" style="margin-bottom:20px"><h3>${t('billingBlocks')}</h3>`;
-    for (const b of [...h.blocks].reverse()) {
+    for (const b of [...blocks].reverse()) {
       const activeTag = b.is_active ? `<span class="status status-working" style="font-size:10px;margin-left:8px">${t('active')}</span>` : '';
       html += `<div class="row row-block"><span class="meta">${b.start}</span><span class="meta">~</span><span class="meta">${b.end}</span><span class="val">${b.total_tokens_fmt}</span><span class="meta">${b.requests} ${t('req')}</span>${activeTag}</div>`;
     }
@@ -729,16 +1170,18 @@ function renderUsage() {
 }
 
 function initCostChart() {
-  if (!historyData || !document.getElementById('costChart')) return;
+  const trendSrc = (rangeHistoryData && rangeHistoryData.trend) ? rangeHistoryData : historyData;
+  if (!trendSrc || !trendSrc.trend || !document.getElementById('costChart')) return;
   if (costChart) costChart.destroy();
   const s = cs();
+  const trend = trendSrc.trend;
   costChart = new Chart(document.getElementById('costChart'), {
     type: 'bar',
     data: {
-      labels: historyData.trend.map(t => t.date),
+      labels: trend.map(t => t.date),
       datasets: [{
-        data: historyData.trend.map(t => t.tokens),
-        backgroundColor: historyData.trend.map(t => t.pct < 50 ? s.getPropertyValue('--green').trim() : t.pct < 80 ? s.getPropertyValue('--yellow').trim() : s.getPropertyValue('--red').trim()),
+        data: trend.map(t => t.tokens),
+        backgroundColor: trend.map(t => t.pct < 50 ? s.getPropertyValue('--green').trim() : t.pct < 80 ? s.getPropertyValue('--yellow').trim() : s.getPropertyValue('--red').trim()),
         borderRadius: 4, borderSkipped: false,
       }]
     },
@@ -746,7 +1189,7 @@ function initCostChart() {
       responsive: true, maintainAspectRatio: false,
       plugins: { legend: { display: false }, tooltip: { callbacks: { label: c => fmtK(c.raw) + ' tokens' } } },
       scales: {
-        x: { grid: { display: false }, ticks: { color: s.getPropertyValue('--dim').trim(), font: { size: 10 } } },
+        x: { grid: { display: false }, ticks: { color: s.getPropertyValue('--dim').trim(), font: { size: 10 }, maxRotation: 45 } },
         y: { grid: { color: s.getPropertyValue('--border').trim() }, ticks: { color: s.getPropertyValue('--dim').trim(), callback: v => fmtK(v) } }
       }
     }
@@ -757,25 +1200,31 @@ function initCostChart() {
 function renderModels() {
   if (!historyData || historyData.loading) return `<div class="empty">${t('loading')}</div>`;
   const h = historyData;
+  const r = rangeHistoryData && !rangeHistoryData.loading ? rangeHistoryData : null;
+  const rangeStats = r ? r.range : h.month;
+  const models = r ? r.models : h.models;
   let html = '';
   html += `<div style="color:var(--dim);font-size:12px;margin-bottom:12px;cursor:help" title="${t('dataSource')}">📂 ${t('dataSource')}</div>`;
 
+  // Date range picker (shared with Usage)
+  html += datePickerHtml();
+
   // Hero
   html += '<div class="hero-grid">';
-  html += `<div class="hero"><div class="label">${t('totalTokens30')}</div><div class="num" style="color:var(--cyan)">${h.month.total_tokens_fmt}</div><div class="sub">${h.month.requests} ${t('req')}</div></div>`;
-  html += `<div class="hero"><div class="label">${t('outputTokens30')}</div><div class="num" style="color:var(--green)">${h.month.output_fmt}</div><div class="sub">${h.month.input_fmt} ${t('input')}</div></div>`;
-  html += `<div class="hero"><div class="label">${t('estCost30')}</div><div class="num" style="color:var(--dim)">~$${h.month.cost.toFixed(0)} <span style="font-size:14px;font-weight:400">USD</span></div><div class="sub">${h.models.length} ${t('modelsUsed')}</div></div>`;
+  html += `<div class="hero"><div class="label">${t('totalTokens')}</div><div class="num" style="color:var(--cyan)">${rangeStats.total_tokens_fmt}</div><div class="sub">${rangeStats.requests} ${t('req')}</div></div>`;
+  html += `<div class="hero"><div class="label">${t('output')}</div><div class="num" style="color:var(--green)">${rangeStats.output_fmt}</div><div class="sub">${rangeStats.input_fmt} ${t('input')}</div></div>`;
+  html += `<div class="hero"><div class="label">${t('estCost')}</div><div class="num" style="color:var(--dim)">~$${rangeStats.cost.toFixed(0)} <span style="font-size:14px;font-weight:400">USD</span></div><div class="sub">${models.length} ${t('modelsUsed')}</div></div>`;
   html += '</div>';
 
   // Doughnut + period breakdown
   html += '<div class="grid2">';
   html += `<div class="card"><h3>${t('tokenDist')}</h3><div class="chart-wrap-sm"><canvas id="modelChart"></canvas></div></div>`;
   html += `<div class="card"><h3>${t('modelDetails')}</h3>`;
-  for (const m of h.models) {
+  for (const m of models) {
     html += `<div class="row"><span class="label">${esc(m.model.replace('claude-',''))}</span><span class="val">${m.total_tokens_fmt}</span><span class="val">${m.pct}%</span></div>`;
   }
   html += `<div style="margin-top:16px;padding-top:12px;border-top:1px solid var(--border)">`;
-  for (const [label, d] of [[t('today'), h.today], [t('d7'), h.week], [t('d30'), h.month]]) {
+  for (const [label, d] of [[t('today'), h.today], [t('d7'), h.week], [t('selectedRange'), rangeStats]]) {
     html += `<div class="row"><span class="label">${label}</span><span class="val">${d.total_tokens_fmt}</span><span class="val">${d.requests} ${t('req')}</span></div>`;
   }
   html += '</div></div>';
@@ -783,7 +1232,7 @@ function renderModels() {
 
   // Per-model detail cards
   html += '<div class="grid3">';
-  for (const m of h.models) {
+  for (const m of models) {
     const name = m.model.replace('claude-','');
     html += `<div class="card"><h3>${esc(name)}</h3>`;
 
@@ -823,24 +1272,90 @@ function renderModels() {
 }
 
 function initModelChart() {
-  if (!historyData || !document.getElementById('modelChart')) return;
+  const src = (rangeHistoryData && rangeHistoryData.models) ? rangeHistoryData : historyData;
+  if (!src || !src.models || !document.getElementById('modelChart')) return;
   if (modelChart) modelChart.destroy();
   const s = cs();
+  const models = src.models;
   const colors = [s.getPropertyValue('--accent').trim(), s.getPropertyValue('--cyan').trim(), s.getPropertyValue('--yellow').trim(), s.getPropertyValue('--green').trim(), s.getPropertyValue('--red').trim()];
   modelChart = new Chart(document.getElementById('modelChart'), {
     type: 'doughnut',
     data: {
-      labels: historyData.models.map(m => m.model.replace('claude-','')),
-      datasets: [{ data: historyData.models.map(m => m.total_tokens), backgroundColor: colors, borderWidth: 0, hoverOffset: 8 }]
+      labels: models.map(m => m.model.replace('claude-','')),
+      datasets: [{ data: models.map(m => m.total_tokens), backgroundColor: colors, borderWidth: 0, hoverOffset: 8 }]
     },
     options: {
       responsive: true, maintainAspectRatio: false, cutout: '65%',
       plugins: {
         legend: { position: 'bottom', labels: { color: s.getPropertyValue('--text').trim(), padding: 16, font: { size: 11 } } },
-        tooltip: { callbacks: { label: c => c.label + ': ' + fmtK(c.raw) + ' tokens (' + historyData.models[c.dataIndex].pct + '%)' } }
+        tooltip: { callbacks: { label: c => c.label + ': ' + fmtK(c.raw) + ' tokens (' + models[c.dataIndex].pct + '%)' } }
       }
     }
   });
+}
+
+// ── Timeline ─────────────────────────────────────
+let timelineData = null;
+
+async function fetchTimeline() { try { timelineData = await (await fetch('/api/timeline')).json(); } catch {} }
+
+function renderTimeline() {
+  if (!timelineData || !timelineData.length) return `<div class="timeline-container"><div class="timeline-empty">${t('tlNoSessions')}</div></div>`;
+
+  const now = Date.now() / 1000;
+  const windowStart = now - 86400;
+  const windowEnd = now;
+  const windowLen = windowEnd - windowStart;
+
+  // Build hour marks
+  let hoursHtml = '';
+  const startDate = new Date(windowStart * 1000);
+  const startHour = new Date(startDate);
+  startHour.setMinutes(0, 0, 0);
+  if (startHour < startDate) startHour.setHours(startHour.getHours() + 1);
+
+  for (let h = new Date(startHour); h.getTime() / 1000 < windowEnd; h.setHours(h.getHours() + 1)) {
+    const ts = h.getTime() / 1000;
+    const pct = ((ts - windowStart) / windowLen * 100);
+    if (pct < 0 || pct > 100) continue;
+    const label = h.getHours().toString().padStart(2, '0') + ':00';
+    hoursHtml += `<span class="timeline-hour-mark" style="left:${pct.toFixed(2)}%">${label}</span>`;
+  }
+
+  const nowPct = ((now - windowStart) / windowLen * 100).toFixed(2);
+
+  let rowsHtml = '';
+  for (const session of timelineData) {
+    let segsHtml = '';
+    for (const seg of session.segments) {
+      const left = Math.max(0, (seg.start - windowStart) / windowLen * 100);
+      const width = Math.min(100 - left, (seg.end - seg.start) / windowLen * 100);
+      if (width <= 0) continue;
+      const cls = seg.type === 'active' ? 'timeline-seg-active' : 'timeline-seg-idle';
+      const tooltip = seg.type === 'active'
+        ? new Date(seg.start * 1000).toLocaleTimeString('sv-SE', {hour:'2-digit',minute:'2-digit'}) + ' - ' + new Date(seg.end * 1000).toLocaleTimeString('sv-SE', {hour:'2-digit',minute:'2-digit'})
+        : '';
+      segsHtml += `<div class="timeline-seg ${cls}" style="left:${left.toFixed(2)}%;width:${width.toFixed(2)}%" ${tooltip ? 'title="'+esc(tooltip)+'"' : ''}></div>`;
+    }
+    segsHtml += `<div class="timeline-now" style="left:${nowPct}%" title="${t('tlNow')}"></div>`;
+
+    const statusCls = statusClass(session.status);
+    rowsHtml += `<div class="timeline-row">
+      <div class="timeline-label"><span class="tl-name">${esc(session.name)}</span><span class="tl-status status ${statusCls}" style="padding:1px 6px;border-radius:4px;font-size:10px">${session.status.toUpperCase()}</span></div>
+      <div class="timeline-bar-wrap">${segsHtml}</div>
+    </div>`;
+  }
+
+  return `<div class="timeline-container">
+    <div class="timeline-header"><h3>${t('timelineTitle')}</h3></div>
+    <div class="timeline-hours">${hoursHtml}</div>
+    ${rowsHtml}
+    <div class="timeline-legend">
+      <span><i class="leg-box" style="background:var(--yellow);opacity:.85"></i>${t('tlActive')}</span>
+      <span><i class="leg-box" style="background:var(--surface2);border:1px solid var(--border)"></i>${t('tlIdle')}</span>
+      <span><i class="leg-box" style="background:var(--red);width:4px"></i>${t('tlNow')}</span>
+    </div>
+  </div>`;
 }
 
 // ── Session expand ──────────────────────────────
@@ -919,8 +1434,9 @@ function render() {
       }
     }
   }
+  else if (currentTab === 'timeline') { el.innerHTML = renderTimeline(); }
   else if (currentTab === 'usage') { el.innerHTML = renderUsage(); requestAnimationFrame(initCostChart); }
-  else { el.innerHTML = renderModels(); requestAnimationFrame(initModelChart); }
+  else if (currentTab === 'models') { el.innerHTML = renderModels(); requestAnimationFrame(initModelChart); }
 }
 
 // Poll — only re-render sessions on 2s tick; charts only on history load
@@ -931,17 +1447,31 @@ async function pollSessions() {
   if (json !== lastSessionsJson) {
     lastSessionsJson = json;
     if (currentTab === 'sessions') render();
+    // Check context alerts after render so DOM cards exist
+    checkCtxAlerts(sessionsData);
   }
 }
 
 async function pollHistory() {
   await fetchHistory();
-  if (currentTab !== 'sessions') render();
+  if (currentTab !== 'sessions' && currentTab !== 'timeline') render();
+}
+
+let lastTimelineJson = '';
+async function pollTimeline() {
+  await fetchTimeline();
+  const json = JSON.stringify(timelineData);
+  if (json !== lastTimelineJson) {
+    lastTimelineJson = json;
+    if (currentTab === 'timeline') render();
+  }
 }
 
 pollHistory();
 pollSessions();
+pollTimeline();
 setInterval(pollSessions, 2000);
+setInterval(pollTimeline, 30000);
 setInterval(pollHistory, 60000);
 </script>
 </body>
@@ -953,15 +1483,34 @@ _HTML_BYTES = HTML.encode()
 # ── HTTP Handler ──────────────────────────────────────────────────────────────
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path == "/":
+        parsed = urlparse(self.path)
+        path = parsed.path
+        qs = parse_qs(parsed.query)
+
+        if path == "/":
             self._respond(200, "text/html", _HTML_BYTES)
-        elif self.path == "/api/sessions":
+        elif path == "/api/sessions":
             self._respond(200, "application/json", json.dumps(sessions_json()).encode())
-        elif self.path == "/api/history":
-            self._respond(200, "application/json", json.dumps(history_json()).encode())
-        elif self.path.startswith("/api/session/"):
+        elif path == "/api/history":
+            from_d = qs.get("from", [None])[0]
+            to_d = qs.get("to", [None])[0]
+            if from_d and to_d:
+                # Validate date format
+                try:
+                    date_cls.fromisoformat(from_d)
+                    date_cls.fromisoformat(to_d)
+                except ValueError:
+                    self._respond(400, "text/plain", b"Invalid date format, use YYYY-MM-DD")
+                    return
+                data = history_json_range(from_d, to_d)
+            else:
+                data = history_json()
+            self._respond(200, "application/json", json.dumps(data).encode())
+        elif path == "/api/timeline":
+            self._respond(200, "application/json", json.dumps(timeline_json()).encode())
+        elif path.startswith("/api/session/"):
             try:
-                pid = int(self.path.split("/")[-1])
+                pid = int(path.split("/")[-1])
                 self._respond(200, "application/json", json.dumps(session_detail(pid)).encode())
             except (ValueError, IndexError):
                 self._respond(400, "text/plain", b"Invalid PID")
